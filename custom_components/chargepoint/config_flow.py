@@ -48,6 +48,7 @@ def _login_schema(
     cookies_json: str = "",
 ) -> vol.Schema:
     """Formulaire unique : identifiants + option cookies + champ cookies."""
+    # Le selector("text", multiline) peut ne pas exister sur HA très ancien; si besoin, on pourrait revenir à 'str'
     return vol.Schema(
         OrderedDict(
             [
@@ -179,7 +180,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                     pass
             return None, error_code
 
-    except ChargePointCommunicationException:
+        except ChargePointCommunicationException:
             _LOGGER.exception("Failed to communicate with ChargePoint")
             return None, "communication_error"
 
