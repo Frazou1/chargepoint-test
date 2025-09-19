@@ -2,6 +2,7 @@
 Custom integration to integrate ChargePoint with Home Assistant.
 
 """
+from . import monkeypatch
 
 import logging
 import os
@@ -71,6 +72,9 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Load the saved entities."""
+    await monkeypatch.ensure_scraper(hass)
+monkeypatch.apply_scoped_patch()
+
     _LOGGER.info(
         "Version %s is starting, if you have any issues please report" " them here: %s",
         VERSION,
