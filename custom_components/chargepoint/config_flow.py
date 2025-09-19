@@ -36,32 +36,30 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# --- Nouveaux champs/constantes pour le mode cookies
+# Champs/constantes pour le mode cookies
 CONF_COOKIES_JSON = "cookies_json"
 CONF_USE_COOKIE_AUTH = "use_cookie_auth"
 COOKIES_PATH = "/config/chargepoint_cookies.json"
 
 
-def _login_schema(username: str = "", use_cookie_auth: bool = False) -> vol.Schema:
+def _login_schema(
+    username: str = "",
+    use_cookie_auth: bool = False,
+    cookies_json: str = "",
+) -> vol.Schema:
+    """Formulaire unique : identifiants + option cookies + champ cookies."""
     return vol.Schema(
         OrderedDict(
             [
                 (vol.Required(CONF_USERNAME, default=username), str),
-                # le mot de passe peut rester vide si "use_cookie_auth" est coché
+                # Mot de passe facultatif si on coche "use_cookie_auth"
                 (vol.Optional(CONF_PASSWORD, default=""), str),
                 (vol.Optional(CONF_USE_COOKIE_AUTH, default=use_cookie_auth), bool),
-            ]
-        )
-    )
-
-
-def _cookie_schema(username: str = "") -> vol.Schema:
-    return vol.Schema(
-        OrderedDict(
-            [
-                (vol.Required(CONF_USERNAME, default=username), str),
-                # zone de texte pour coller le JSON de cookies
-                (vol.Required(CONF_COOKIES_JSON, default=""), str),
+                # Champ multiligne pour coller les cookies (JSON ou header)
+                (
+                    vol.Optional(CONF_COOKIES_JSON, default=cookies_json),
+                    selector({"text": {"multiline": True}}),
+                ),
             ]
         )
     )
@@ -91,34 +89,34 @@ def _options_schema(poll_interval: int | str = POLL_INTERVAL_DEFAULT) -> vol.Sch
 
 
 def _save_cookies_json(raw: str) -> int:
-    """Valide et sauvegarde le JSON de cookies dans /config.
-    Accepte soit un JSON de liste, soit un header 'name=value; name2=value2; ...'."""
-    import json, os
-
+    """Valider et sauvegarder le JSON de cookies dans /config.
+    Accepte un JSON (liste d'objets) ou un header 'name=value; ...'."""
     def parse_header(header: str):
         items = []
         for part in header.split(";"):
             part = part.strip()
-            if not part:
-                continue
-            if "=" not in part:
+            if not part or "=" not in part:
                 continue
             name, value = part.split("=", 1)
-            items.append({
-                "name": name.strip(),
-                "value": value.strip(),
-                "domain": ".chargepoint.com",
-                "path": "/",
-            })
+            items.append(
+                {
+                    "name": name.strip(),
+                    "value": value.strip(),
+                    "domain": ".chargepoint.com",
+                    "path": "/",
+                }
+            )
         return items
 
-    raw = raw.strip()
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("Vide")
+
     if raw.startswith("["):
         data = json.loads(raw)
         if not isinstance(data, list):
             raise ValueError("Le JSON doit être une liste d'objets cookie.")
     else:
-        # On considère que c'est un header 'name=value; ...'
         data = parse_header(raw)
         if not data:
             raise ValueError("Impossible de parser le header de cookies.")
@@ -127,7 +125,6 @@ def _save_cookies_json(raw: str) -> int:
     with open(COOKIES_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return len(data)
-
 
 
 class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
@@ -182,7 +179,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                     pass
             return None, error_code
 
-        except ChargePointCommunicationException:
+    except ChargePointCommunicationException:
             _LOGGER.exception("Failed to communicate with ChargePoint")
             return None, "communication_error"
 
@@ -201,23 +198,56 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle a flow initialized by the user."""
+        """Formulaire unique : login classique OU cookies."""
         username = ""
         errors: dict[str, str] = {}
         use_cookie_auth = False
+        cookies_json = ""
 
         if user_input is not None:
             username = user_input.get(CONF_USERNAME, "")
             password = user_input.get(CONF_PASSWORD, "")
             use_cookie_auth = bool(user_input.get(CONF_USE_COOKIE_AUTH, False))
-
-            if use_cookie_auth:
-                # Aller à l'étape d'import de cookies
-                return await self.async_step_cookie({"username": username})
+            cookies_json = user_input.get(CONF_COOKIES_JSON, "")
 
             await self.async_set_unique_id(username)
             self._abort_if_unique_id_configured()
 
+            if use_cookie_auth:
+                # Sauvegarder les cookies (obligatoire si case cochée)
+                try:
+                    count = await self.hass.async_add_executor_job(
+                        _save_cookies_json, cookies_json
+                    )
+                    _LOGGER.warning("Cookies importés (%s entrées).", count)
+                except Exception:
+                    errors["base"] = "invalid_cookies_json"
+                    return self.async_show_form(
+                        step_id="user",
+                        data_schema=_login_schema(username, use_cookie_auth, cookies_json),
+                        errors=errors or {"base": "invalid_cookies_json"},
+                    )
+                # Tenter la "connexion" sans mot de passe → monkeypatch skip login()
+                session_token, error = await self._login(username, "")
+                if error is not None:
+                    errors["base"] = error
+                if session_token:
+                    return self.async_create_entry(
+                        title=username,
+                        data={
+                            CONF_USERNAME: username,
+                            CONF_PASSWORD: "",
+                            CONF_ACCESS_TOKEN: session_token,
+                        },
+                    )
+                # échec → réafficher le formulaire avec l'erreur
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=_login_schema(username, use_cookie_auth, cookies_json),
+                    errors=errors or {"base": "auth_failed"},
+                )
+
+            # Chemin “login classique”
             session_token, error = await self._login(username, password or "")
             if error is not None:
                 errors["base"] = error
@@ -233,64 +263,9 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=_login_schema(username, use_cookie_auth),
+            data_schema=_login_schema(username, use_cookie_auth, cookies_json),
             errors=errors,
         )
-
-    async def async_step_cookie(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Importer des cookies et tenter la connexion sans login."""
-        errors: dict[str, str] = {}
-        username = (user_input or {}).get("username", "")
-
-        if user_input and CONF_COOKIES_JSON in user_input:
-            username = user_input.get(CONF_USERNAME, username)
-            raw = user_input.get(CONF_COOKIES_JSON, "")
-
-            # 1) Sauvegarder le JSON de cookies
-            try:
-                count = await self.hass.async_add_executor_job(_save_cookies_json, raw)
-                _LOGGER.warning("Cookies importés (%s entrées).", count)
-            except Exception:
-                errors["base"] = "invalid_cookies_json"
-                return self.async_show_form(
-                    step_id="cookie",
-                    data_schema=_cookie_schema(username),
-                    errors=errors,
-                )
-
-            # 2) Tenter une "connexion" sans mot de passe → monkeypatch skip login()
-            await self.async_set_unique_id(username)
-            self._abort_if_unique_id_configured()
-
-            session_token, error = await self._login(username, "")
-            if error is not None:
-                errors["base"] = error
-                return self.async_show_form(
-                    step_id="cookie",
-                    data_schema=_cookie_schema(username),
-                    errors=errors or {"base": "unknown"},
-                )
-
-
-            if session_token:
-                return self.async_create_entry(
-                    title=username,
-                    data={
-                        CONF_USERNAME: username,
-                        CONF_PASSWORD: "",
-                        CONF_ACCESS_TOKEN: session_token,
-                    },
-                )
-
-        # Premier affichage de l'étape cookies (ou ré-affichage avec erreurs)
-                return self.async_show_form(
-                    step_id="cookie",
-                    data_schema=_cookie_schema(username),
-                    errors=errors or {"base": "unknown"},
-                )
-
 
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
