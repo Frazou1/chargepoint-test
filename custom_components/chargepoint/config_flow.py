@@ -151,7 +151,23 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
             client = await self.hass.async_add_executor_job(
                 ChargePoint, username, password
             )
-            return client.session_token, None
+
+            # --- IMPORTANT : fallback si on a skip le login via cookies mais pas de token
+            token = getattr(client, "session_token", None)
+            if not token:
+                try:
+                    # si des cookies d'auth sont chargés dans le scraper → on valide
+                    from .monkeypatch import _has_auth_cookies
+                    if _has_auth_cookies():
+                        _LOGGER.warning(
+                            "ChargePoint: session_token absent mais cookies présents → accept."
+                        )
+                        return "cookie-auth", None
+                except Exception:
+                    # au pire, on continue sans fallback (géré plus bas)
+                    pass
+
+            return token, None
 
         except ChargePointLoginError as exc:
             # Serveur peut renvoyer HTML (DataDome) -> pas de JSON
@@ -187,6 +203,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
         except Exception:
             _LOGGER.exception("Unexpected error while authenticating to ChargePoint")
             return None, "unknown"
+
 
     @staticmethod
     @callback
