@@ -36,31 +36,40 @@ async def ensure_scraper(hass):
 
 def apply_scoped_patch():
     """
-    Patch *uniquement* le module python_chargepoint pour utiliser NOTRE scraper,
-    sans modifier requests global ni impacter d'autres intégrations.
+    Patch uniquement la classe ChargePoint pour :
+      - injecter notre scraper dans self._session
+      - skipper login() si des cookies pré-authentifiés existent
     """
     global _scraper
     if _scraper is None:
         raise RuntimeError("ChargePoint: scraper non initialisé (ensure_scraper manquant)")
 
     import python_chargepoint.client as cpc
+    from .cookies import load_cookies
 
-    # 1) Remplacer la fabrique de Session utilisée par la lib
-    def _session_factory(*args, **kwargs):
-        return _scraper
-    cpc.requests.Session = _session_factory  # type: ignore[attr-defined]
+    # Sauvegarde du login original
+    _orig_login = cpc.ChargePoint.login
 
-    # 2) Skip login() si cookies présents
-    try:
-        from .cookies import load_cookies
-        _orig_login = cpc.ChargePoint.login
+    def _patched_login(self, username, password):
+        # 1) Injecter notre scraper dans l'instance AVANT toute requête
+        try:
+            self._session = _scraper  # la lib utilise self._session pour ses calls
+        except Exception:
+            pass
 
-        def _patched_login(self, username, password):
-            if load_cookies():
-                _LOGGER.warning("ChargePoint: cookies présents → skip login().")
-                return True
-            return _orig_login(self, username, password)
+        # 2) Si cookies présents → on évite l'endpoint de login (anti-bot)
+        jar = load_cookies()
+        if jar:
+            _LOGGER.warning("ChargePoint: cookies présents → skip login().")
+            # s'assurer que le scraper a aussi ces cookies
+            try:
+                _scraper.cookies.update(jar)
+            except Exception:
+                pass
+            return True
 
-        cpc.ChargePoint.login = _patched_login
-    except Exception as e:
-        _LOGGER.debug("ChargePoint: patch login() non appliqué (%s)", e)
+        # 3) Sinon on appelle le login original (qui utilisera now self._session = _scraper)
+        return _orig_login(self, username, password)
+
+    # Appliquer notre login patché
+    cpc.ChargePoint.login = _patched_login
