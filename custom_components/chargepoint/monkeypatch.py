@@ -1,153 +1,57 @@
 from __future__ import annotations
 import logging
-from typing import Optional
-
 _LOGGER = logging.getLogger(__name__)
-_scraper = None  # construit une seule fois
-
+_scraper = None
 
 def _build_scraper():
-    """Création synchrone du cloudscraper (à appeler dans un executor)."""
     import cloudscraper
-    s = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False}
-    )
-    s.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/116 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-        }
-    )
+    s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    })
+    # pas d'Authorization en cookies-only
+    s.headers.pop("Authorization", None)
     return s
 
-
-def _has_auth_cookies() -> bool:
-    """Détecte la présence de cookies utiles pour éviter le login."""
-    global _scraper
-    if _scraper is None:
-        return False
-    jar = _scraper.cookies
-    wanted = {"auth-session", "coulomb_sess", "ci_ui_session", "datadome"}
+def _load_cookies_into(scraper):
     try:
-        for c in jar:
-            if c.name in wanted:
-                return True
-    except Exception:
-        pass
-    return False
-
+        from .cookies import load_cookies
+        jar = load_cookies()
+        if jar:
+            scraper.cookies.update(jar)
+            _LOGGER.warning("ChargePoint: cookies pré-authentifiés chargés.")
+    except Exception as e:
+        _LOGGER.debug("ChargePoint: pas de cookies pré-authentifiés (%s)", e)
 
 async def ensure_scraper(hass):
-    """À appeler avant toute utilisation: construit/charge le scraper SANS I/O bloquant."""
     global _scraper
     if _scraper is None:
         _LOGGER.warning("ChargePoint: création du scraper en executor…")
         _scraper = await hass.async_add_executor_job(_build_scraper)
-
-        # Charger les cookies depuis /config via un executor (fonction async dans cookies.py)
-        try:
-            from .cookies import load_cookies  # version ASYNC
-            jar = await load_cookies(hass)
-            if jar:
-                _scraper.cookies.update(jar)
-                _LOGGER.warning("ChargePoint: cookies pré-authentifiés chargés.")
-        except Exception:
-            _LOGGER.debug(
-                "ChargePoint: pas de cookies pré-authentifiés ou erreur de lecture",
-                exc_info=True,
-            )
-
+        _load_cookies_into(_scraper)
 
 def apply_scoped_patch():
-    """
-    Patch la classe ChargePoint pour :
-      - injecter notre scraper dans self._session
-      - skipper login() si des cookies pré-authentifiés sont déjà en mémoire
-      - retirer le header Authorization quand on utilise des cookies
-    NOTE: AUCUNE lecture de fichier ici (pas d'I/O bloquant).
-    """
     global _scraper
     if _scraper is None:
-        raise RuntimeError(
-            "ChargePoint: scraper non initialisé (ensure_scraper manquant)"
-        )
-
+        raise RuntimeError("ChargePoint: scraper non initialisé (ensure_scraper manquant)")
     import python_chargepoint.client as cpc
-
-    # --- helpers internes (pas d'I/O) ---------------------------------------
-    def _get_cookie_value(name: str) -> str | None:
-        try:
-            for c in _scraper.cookies:
-                if c.name == name and c.value:
-                    return c.value
-        except Exception:
-            pass
-        return None
-
-    # Sauvegarde du login original
     _orig_login = cpc.ChargePoint.login
-
     def _patched_login(self, username, password):
-        # 1) Injecter notre scraper dans l'instance AVANT toute requête
         try:
-            self._session = _scraper  # la lib utilise self._session pour ses calls
+            self._session = _scraper
         except Exception:
             pass
-
-        # 2) Si cookies d’auth présents → éviter l'endpoint de login (anti-bot)
-        if _has_auth_cookies():
+        # cookies présents → on évite toute auth active
+        if _scraper and _scraper.cookies:
             _LOGGER.warning("ChargePoint: cookies présents → skip login().")
+            # s’assurer d’aucun header Authorization
             try:
-                # Utiliser le JWT réel du cookie 'auth-session' (format correct)
-                jwt = _get_cookie_value("auth-session")
-                if jwt:
-                    self.session_token = jwt
-                else:
-                    # fallback ultra-minimal si jamais absent (devrait pas arriver)
-                    self.session_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjb29raWUtYXV0aCJ9.sig"
+                self._session.headers.pop("Authorization", None)
             except Exception:
                 pass
             return True
-
-        # 3) Sinon on appelle le login original (qui utilisera self._session = _scraper)
         return _orig_login(self, username, password)
-
-    # Appliquer notre login patché (une seule fois)
     if getattr(cpc.ChargePoint.login, "__name__", "") != "_patched_login":
         cpc.ChargePoint.login = _patched_login
-
-    # 4) Patch de la construction des headers pour SUPPRIMER Authorization si cookies présents
-    #    (selon les versions, la méthode peut s'appeler _headers ou headers)
-    def _wrap_headers_method(method_name: str):
-        if not hasattr(cpc.ChargePoint, method_name):
-            return
-        _orig = getattr(cpc.ChargePoint, method_name)
-
-        # Ne pas double-patcher
-        if getattr(_orig, "__name__", "") == "_patched_headers":
-            return
-
-        def _patched_headers(self, *args, **kwargs):
-            h = _orig(self, *args, **kwargs)
-            try:
-                # h peut être dict ou list de tuples selon l'implémentation
-                if isinstance(h, list):
-                    h = dict(h)
-                if _has_auth_cookies():
-                    h = dict(h)
-                    h.pop("Authorization", None)
-            except Exception:
-                pass
-            return h
-
-        _patched_headers.__name__ = "_patched_headers"
-        setattr(cpc.ChargePoint, method_name, _patched_headers)
-
-    # Essaye de patcher _headers puis fallback sur headers
-    _wrap_headers_method("_headers")
-    _wrap_headers_method("headers")
