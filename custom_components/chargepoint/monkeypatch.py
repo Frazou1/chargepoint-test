@@ -90,7 +90,11 @@ def apply_scoped_patch():
 
         # 2) Si cookies d’auth présents → éviter l'endpoint de login (anti-bot)
         if _has_auth_cookies():
-            _LOGGER.warning("ChargePoint: cookies présents → skip login().")
+            try:
+                # Marquer l'instance comme "authentifiée" pour le flow
+                self.session_token = "cookie-auth"
+            except Exception:
+                pass
             return True
 
         # 3) Sinon on appelle le login original (qui utilisera self._session = _scraper)
