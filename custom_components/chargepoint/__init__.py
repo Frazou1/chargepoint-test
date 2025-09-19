@@ -1,11 +1,11 @@
 """
 Custom integration to integrate ChargePoint with Home Assistant.
-
 """
-from . import monkeypatch
+from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+
 from python_chargepoint import ChargePoint
 from python_chargepoint.exceptions import (
     ChargePointBaseException,
@@ -36,6 +37,7 @@ from python_chargepoint.types import (
     UserChargingStatus,
 )
 
+from . import monkeypatch
 from .const import (
     ACCT_CRG_STATUS,
     ACCT_HOME_CRGS,
@@ -53,9 +55,17 @@ from .const import (
     VERSION,
 )
 
-CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+# Optionnel : flag posé par le config_flow quand on choisit l’auth par cookies
+try:
+    from .const import CONF_COOKIE_AUTH  # ajouté dans const.py
+except Exception:  # retro-compat si pas présent
+    CONF_COOKIE_AUTH = "cookie_auth"
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# Regex très permissive “JWT-like” (3 segments base64url)
+_JWT_RE = re.compile(r"^[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$")
 
 
 def remove_session_token_from_disk(hass: HomeAssistant) -> None:
@@ -72,38 +82,88 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Load the saved entities."""
+    # Préparer le scraper/patch AVANT de créer le client
     await monkeypatch.ensure_scraper(hass)
     monkeypatch.apply_scoped_patch()
 
     _LOGGER.info(
-        "Version %s is starting, if you have any issues please report" " them here: %s",
+        "Version %s is starting, if you have any issues please report them here: %s",
         VERSION,
         ISSUE_URL,
     )
-    username = entry.data[CONF_USERNAME]
-    password = entry.data[CONF_PASSWORD]
-    session_token = entry.data[CONF_ACCESS_TOKEN]
 
-    # Cleanup the old session token from disk, we only store it in the ConfigEntry now.
+    username = entry.data.get(CONF_USERNAME, "")
+    password = entry.data.get(CONF_PASSWORD, "")
+    stored_token = entry.data.get(CONF_ACCESS_TOKEN, "") or ""
+    use_cookie_auth = bool(entry.data.get(CONF_COOKIE_AUTH, False))
+
+    # Nettoyage ancien fichier token
     await hass.async_add_executor_job(remove_session_token_from_disk, hass)
 
+    # Déterminer quel token passer au constructeur:
+    # - en mode cookies, on prend le JWT réel du cookie `auth-session` si présent;
+    #   sinon on ne passe **aucun** token (None) pour éviter l'erreur de format.
+    # - hors cookies, on ne passe le token que s'il “ressemble” à un JWT.
+    token_to_pass: Optional[str] = None
+
+    def _jwt_from_cookie() -> Optional[str]:
+        try:
+            if monkeypatch._scraper is None:
+                return None
+            for c in monkeypatch._scraper.cookies:
+                if c.name == "auth-session" and c.value:
+                    return c.value
+        except Exception:
+            pass
+        return None
+
+    if use_cookie_auth:
+        cookie_jwt = _jwt_from_cookie()
+        if cookie_jwt and _JWT_RE.match(cookie_jwt):
+            token_to_pass = cookie_jwt
+        else:
+            token_to_pass = None  # pas de token → le client utilisera les cookies
+    else:
+        if stored_token and _JWT_RE.match(stored_token):
+            token_to_pass = stored_token
+        else:
+            # Ancien chemin sans cookies → si format invalide, on échouera plus bas proprement
+            token_to_pass = None
+
     try:
+        # Important: ne passe PAS de token invalide → sinon la lib lève "Invalid session token format"
         client: ChargePoint = await hass.async_add_executor_job(
-            ChargePoint, username, password, session_token
+            ChargePoint, username, password, token_to_pass
         )
 
-        if client.session_token != session_token:
-            _LOGGER.debug("Session token refreshed by client, updating config entry")
-            hass.config_entries.async_update_entry(
-                entry,
-                data={
-                    **entry.data,
-                    CONF_ACCESS_TOKEN: session_token,
-                },
-            )
+        # En mode cookies, si on a un JWT côté cookie mais que le client n'a rien,
+        # on le renseigne (la lib n'en a pas besoin quand on a les cookies, mais ça rassure le reste du code).
+        if use_cookie_auth:
+            jwt_now = _jwt_from_cookie()
+            if jwt_now and _JWT_RE.match(jwt_now):
+                try:
+                    client.session_token = jwt_now
+                except Exception:
+                    pass
+
+        # Si la lib a rafraîchi le token et qu'il est bien “JWT-like”, on le persiste.
+        if getattr(client, "session_token", None) and _JWT_RE.match(client.session_token):
+            if client.session_token != stored_token:
+                _LOGGER.debug("Session token refreshed by client, updating config entry")
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **entry.data,
+                        CONF_ACCESS_TOKEN: client.session_token,
+                    },
+                )
+
     except ChargePointLoginError as exc:
+        # En mode cookies-only, on ne devrait jamais tenter un vrai login; s'il arrive,
+        # c'est que les cookies ne passent plus (datadome/expiration). On demande une reauth (nouveaux cookies).
         _LOGGER.error("Failed to authenticate to ChargePoint")
         raise ConfigEntryAuthFailed(exc) from exc
+
     except ChargePointBaseException as exc:
         _LOGGER.error("Unknown ChargePoint Error!")
         raise ConfigEntryNotReady from exc
@@ -111,7 +171,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {})
 
     async def async_update_data(is_retry: bool = False):
-        """Fetch data from ChargePoint API"""
+        """Fetch data from ChargePoint API."""
         data = {
             ACCT_INFO: None,
             ACCT_CRG_STATUS: None,
@@ -153,24 +213,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 data[ACCT_HOME_CRGS][charger] = (hcrg_status, hcrg_tech_info)
 
             return data
+
         except ChargePointInvalidSession:
-            if not is_retry:
-                _LOGGER.warning(
-                    "ChargePoint Session Token is invalid, attempting to re-login"
+            # Si le token est invalide:
+            if use_cookie_auth:
+                # En mode cookies, on NE tente PAS de relogin (bloqué par l'anti-bot).
+                # On force une reauth côté HA (l’utilisateur devra recoller des cookies frais).
+                _LOGGER.error(
+                    "ChargePoint cookie session expired/invalid. Please re-import cookies."
                 )
-                try:
-                    await hass.async_add_executor_job(client.login, username, password)
-                    hass.config_entries.async_update_entry(
-                        entry,
-                        data={
-                            **entry.data,
-                            CONF_ACCESS_TOKEN: session_token,
-                        },
+                raise ConfigEntryAuthFailed("cookie_expired")
+            else:
+                if not is_retry:
+                    _LOGGER.warning(
+                        "ChargePoint Session Token is invalid, attempting to re-login"
                     )
-                    return await async_update_data(is_retry=True)
-                except ChargePointLoginError as exc:
-                    _LOGGER.error("Failed to authenticate to ChargePoint")
-                    raise ConfigEntryAuthFailed(exc) from exc
+                    try:
+                        await hass.async_add_executor_job(client.login, username, password)
+                        # Si la lib a remis un token, persiste-le
+                        if getattr(client, "session_token", None) and _JWT_RE.match(
+                            client.session_token
+                        ):
+                            hass.config_entries.async_update_entry(
+                                entry,
+                                data={
+                                    **entry.data,
+                                    CONF_ACCESS_TOKEN: client.session_token,
+                                },
+                            )
+                        return await async_update_data(is_retry=True)
+                    except ChargePointLoginError as exc:
+                        _LOGGER.error("Failed to authenticate to ChargePoint")
+                        raise ConfigEntryAuthFailed(exc) from exc
+                # Si on était déjà en retry, on laisse tomber
+                raise UpdateFailed("invalid session after retry")
 
         except ChargePointCommunicationException as err:
             _LOGGER.error("Failed to update ChargePoint State")
@@ -210,10 +286,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
-
     return unload_ok
 
 
@@ -278,7 +352,6 @@ class ChargePointChargerEntity(CoordinatorEntity):
         session: ChargingSession = self.coordinator.data[ACCT_SESSION]
         if not session:
             return
-
         _LOGGER.debug(
             "Session in progress, checking if home charger (%s): %s",
             self.charger_id,
