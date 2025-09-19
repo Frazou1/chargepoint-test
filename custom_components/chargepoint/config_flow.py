@@ -1,4 +1,5 @@
 """Adds config flow for ChargePoint."""
+from __future__ import annotations
 
 import json
 import os
@@ -20,18 +21,19 @@ from homeassistant.core import callback
 from homeassistant.helpers.selector import selector
 
 from . import monkeypatch  # IMPORTANT: préparer le client avant login
-
-from python_chargepoint import ChargePoint
-from python_chargepoint.exceptions import (
-    ChargePointCommunicationException,
-    ChargePointLoginError,
-)
-
 from .const import (
     DOMAIN,
     OPTION_POLL_INTERVAL,
     POLL_INTERVAL_DEFAULT,
     POLL_INTERVAL_OPTIONS,
+    # ajouté dans const.py
+    CONF_COOKIE_AUTH,
+)
+
+from python_chargepoint import ChargePoint
+from python_chargepoint.exceptions import (
+    ChargePointCommunicationException,
+    ChargePointLoginError,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,7 +50,6 @@ def _login_schema(
     cookies_json: str = "",
 ) -> vol.Schema:
     """Formulaire unique : identifiants + option cookies + champ cookies."""
-    # Le selector("text", multiline) peut ne pas exister sur HA très ancien; si besoin, on pourrait revenir à 'str'
     return vol.Schema(
         OrderedDict(
             [
@@ -140,7 +141,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
     async def _login(
         self, username: str, password: str
     ) -> Tuple[str | None, str | None]:
-        """Attempt login; returns (session_token, error_code)."""
+        """Attempt login (chemin 'classique'); returns (session_token, error_code)."""
 
         # Assurer le scraper + patch *avant* la création du client
         await monkeypatch.ensure_scraper(self.hass)
@@ -152,20 +153,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                 ChargePoint, username, password
             )
 
-            # --- IMPORTANT : fallback si on a skip le login via cookies mais pas de token
-            # --- IMPORTANT : fallback si on a skip le login via cookies mais pas de token
             token = getattr(client, "session_token", None)
-            if not token:
-                try:
-                    from .monkeypatch import _has_auth_cookies
-                    if _has_auth_cookies():
-                        _LOGGER.warning("ChargePoint: session_token absent mais cookies présents → accept.")
-                        # Donner un token "JWT-like" pour satisfaire les validations de format
-                        return "eyJhbGciOiJIUzI1NiJ9.cookie.auth", None
-                except Exception:
-                    pass
-
-
             return token, None
 
         except ChargePointLoginError as exc:
@@ -203,7 +191,6 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
             _LOGGER.exception("Unexpected error while authenticating to ChargePoint")
             return None, "unknown"
 
-
     @staticmethod
     @callback
     def async_get_options_flow(
@@ -231,7 +218,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             if use_cookie_auth:
-                # Sauvegarder les cookies (obligatoire si case cochée)
+                # 1) Sauvegarder les cookies (obligatoire si case cochée)
                 try:
                     count = await self.hass.async_add_executor_job(
                         _save_cookies_json, cookies_json
@@ -244,27 +231,34 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                         data_schema=_login_schema(username, use_cookie_auth, cookies_json),
                         errors=errors or {"base": "invalid_cookies_json"},
                     )
-                # Tenter la "connexion" sans mot de passe → monkeypatch skip login()
-                session_token, error = await self._login(username, "")
-                if error is not None:
-                    errors["base"] = error
-                if session_token:
-                    return self.async_create_entry(
-                        title=username,
-                        data={
-                            CONF_USERNAME: username,
-                            CONF_PASSWORD: "",
-                            CONF_ACCESS_TOKEN: session_token,
-                        },
-                    )
-                # échec → réafficher le formulaire avec l'erreur
-                return self.async_show_form(
-                    step_id="user",
-                    data_schema=_login_schema(username, use_cookie_auth, cookies_json),
-                    errors=errors or {"base": "auth_failed"},
+
+                # 2) Préparer le scraper/patch pour qu'ils prennent ces cookies dès maintenant
+                await monkeypatch.ensure_scraper(self.hass)
+                monkeypatch.apply_scoped_patch()
+
+                # 3) Essayer de récupérer le JWT depuis le cookie 'auth-session' (sinon vide)
+                jwt_cookie = None
+                try:
+                    if monkeypatch._scraper is not None:
+                        for c in monkeypatch._scraper.cookies:
+                            if c.name == "auth-session" and c.value:
+                                jwt_cookie = c.value
+                                break
+                except Exception:
+                    pass
+
+                # 4) Créer l'entrée DIRECTEMENT en mode cookies (pas de login)
+                return self.async_create_entry(
+                    title=username,
+                    data={
+                        CONF_USERNAME: username,
+                        CONF_PASSWORD: "",  # inutile en mode cookies
+                        CONF_ACCESS_TOKEN: jwt_cookie or "",
+                        CONF_COOKIE_AUTH: True,  # <<< FLAG clé pour __init__.py
+                    },
                 )
 
-            # Chemin “login classique”
+            # ---- Chemin “login classique” ----
             session_token, error = await self._login(username, password or "")
             if error is not None:
                 errors["base"] = error
