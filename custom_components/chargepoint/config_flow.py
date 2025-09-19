@@ -16,6 +16,10 @@ from homeassistant.config_entries import (
 from homeassistant.const import CONF_ACCESS_TOKEN, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers.selector import selector
+
+# --- PATCH: on importe notre monkeypatch pour préparer le client avant login
+from . import monkeypatch
+
 from python_chargepoint import ChargePoint
 from python_chargepoint.exceptions import (
     ChargePointCommunicationException,
@@ -81,25 +85,56 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
     async def _login(
         self, username: str, password: str
     ) -> Tuple[str | None, str | None]:
-        """Return true if credentials is valid."""
+        """Attempt login; returns (session_token, error_code)."""
+
+        # --- PATCH: on s'assure que le scraper est prêt et que le patch est appliqué
+        await monkeypatch.ensure_scraper(self.hass)
+        monkeypatch.apply_scoped_patch()
+
         try:
             _LOGGER.info("Attempting to authenticate with chargepoint")
             client = await self.hass.async_add_executor_job(
                 ChargePoint, username, password
             )
             return client.session_token, None
+
         except ChargePointLoginError as exc:
-            error_id = exc.response.json().get("errorId")
-            if error_id == 9:
-                _LOGGER.exception("Invalid credentials for ChargePoint")
-                return None, "invalid_credentials"
-            elif error_id == 241:
-                _LOGGER.exception("ChargePoint Account is locked")
-                return None, "account_locked"
-            return None, str(exc)
+            # Certains serveurs renvoient une page HTML (DataDome) -> pas de JSON.
+            error_code = "auth_failed"
+            try:
+                # Essayer JSON en premier
+                data = exc.response.json()  # type: ignore[attr-defined]
+                error_id = data.get("errorId")
+                if error_id == 9:
+                    _LOGGER.exception("Invalid credentials for ChargePoint")
+                    return None, "invalid_credentials"
+                if error_id == 241:
+                    _LOGGER.exception("ChargePoint Account is locked")
+                    return None, "account_locked"
+                # Conserver un code générique sinon
+                error_code = str(error_id or error_code)
+            except Exception:
+                # Pas de JSON -> regarder le texte
+                try:
+                    text = exc.response.text  # type: ignore[attr-defined]
+                    if (
+                        "captcha-delivery.com" in text
+                        or "Please enable JS" in text
+                        or "DataDome" in text
+                    ):
+                        _LOGGER.error("Anti-bot challenge detected during login")
+                        return None, "antibot_challenge"
+                except Exception:
+                    pass
+            return None, error_code
+
         except ChargePointCommunicationException as exc:
             _LOGGER.exception("Failed to communicate with ChargePoint")
-            return None, str(exc)
+            return None, "communication_error"
+
+        except Exception as exc:  # filet de sécurité
+            _LOGGER.exception("Unexpected error while authenticating to ChargePoint")
+            return None, "unknown"
 
     @staticmethod
     @callback
@@ -114,7 +149,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle a flow initialized by the user."""
         username = ""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
             username = user_input[CONF_USERNAME]
@@ -125,7 +160,12 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
 
             session_token, error = await self._login(username, password)
             if error is not None:
-                errors["base"] = error
+                # Remonter un message clair lorsque le challenge anti-bot est détecté
+                if error == "antibot_challenge":
+                    errors["base"] = "antibot_challenge"  # à traduire via strings.json si besoin
+                else:
+                    errors["base"] = error
+
             if session_token:
                 return self.async_create_entry(
                     title=user_input[CONF_USERNAME],
@@ -154,7 +194,7 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         username = self._reauth_entry.data[CONF_USERNAME]
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input is not None:
             password = user_input[CONF_PASSWORD]
