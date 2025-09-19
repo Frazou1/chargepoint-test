@@ -68,6 +68,7 @@ def apply_scoped_patch():
     Patch la classe ChargePoint pour :
       - injecter notre scraper dans self._session
       - skipper login() si des cookies pré-authentifiés sont déjà en mémoire
+      - retirer le header Authorization quand on utilise des cookies
     NOTE: AUCUNE lecture de fichier ici (pas d'I/O bloquant).
     """
     global _scraper
@@ -90,9 +91,10 @@ def apply_scoped_patch():
 
         # 2) Si cookies d’auth présents → éviter l'endpoint de login (anti-bot)
         if _has_auth_cookies():
+            _LOGGER.warning("ChargePoint: cookies présents → skip login().")
             try:
-                # Marquer l'instance comme "authentifiée" pour le flow
-                self.session_token = "cookie-auth"
+                # Donner un token "JWT-like" pour satisfaire les validations de format
+                self.session_token = "eyJhbGciOiJIUzI1NiJ9.cookie.auth"
             except Exception:
                 pass
             return True
@@ -103,3 +105,35 @@ def apply_scoped_patch():
     # Appliquer notre login patché (une seule fois)
     if getattr(cpc.ChargePoint.login, "__name__", "") != "_patched_login":
         cpc.ChargePoint.login = _patched_login
+
+    # 4) Patch de la construction des headers pour SUPPRIMER Authorization si cookies présents
+    #    (selon les versions, la méthode peut s'appeler _headers ou headers)
+    def _wrap_headers_method(method_name: str):
+        if not hasattr(cpc.ChargePoint, method_name):
+            return
+        _orig = getattr(cpc.ChargePoint, method_name)
+
+        # Ne pas double-patcher
+        if getattr(_orig, "__name__", "") == "_patched_headers":
+            return
+
+        def _patched_headers(self, *args, **kwargs):
+            h = _orig(self, *args, **kwargs)
+            try:
+                # h peut être dict ou list de tuples selon l'implémentation;
+                # on force un dict pour manipuler proprement.
+                if isinstance(h, list):
+                    h = dict(h)
+                if _has_auth_cookies():
+                    h = dict(h)
+                    h.pop("Authorization", None)
+            except Exception:
+                pass
+            return h
+
+        _patched_headers.__name__ = "_patched_headers"
+        setattr(cpc.ChargePoint, method_name, _patched_headers)
+
+    # Essaye de patcher _headers (méthode la plus courante) puis fallback sur headers
+    _wrap_headers_method("_headers")
+    _wrap_headers_method("headers")
