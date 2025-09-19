@@ -1,11 +1,11 @@
 {
   "domain": "chargepoint",
-  "name": "ChargePoint",
+  "name": "ChargePointTest",
   "codeowners": ["@mbillow"],
   "config_flow": true,
-  "documentation": "https://github.com/mbillow/ha-chargepoint",
+  "documentation": "https://github.com/Frazou1/chargepoint-test",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/mbillow/ha-chargepoint/issues",
+  "issue_tracker": "https://github.com/Frazou1/chargepoint-test/issues",
   "requirements": [
       "python-chargepoint==1.10.0"
     ],
