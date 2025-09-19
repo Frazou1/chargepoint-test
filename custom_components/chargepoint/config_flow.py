@@ -91,14 +91,43 @@ def _options_schema(poll_interval: int | str = POLL_INTERVAL_DEFAULT) -> vol.Sch
 
 
 def _save_cookies_json(raw: str) -> int:
-    """Valider et sauvegarder le JSON de cookies dans /config."""
-    data = json.loads(raw)
-    if not isinstance(data, list):
-        raise ValueError("Le JSON doit être une liste d'objets cookie.")
+    """Valide et sauvegarde le JSON de cookies dans /config.
+    Accepte soit un JSON de liste, soit un header 'name=value; name2=value2; ...'."""
+    import json, os
+
+    def parse_header(header: str):
+        items = []
+        for part in header.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            items.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": ".chargepoint.com",
+                "path": "/",
+            })
+        return items
+
+    raw = raw.strip()
+    if raw.startswith("["):
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            raise ValueError("Le JSON doit être une liste d'objets cookie.")
+    else:
+        # On considère que c'est un header 'name=value; ...'
+        data = parse_header(raw)
+        if not data:
+            raise ValueError("Impossible de parser le header de cookies.")
+
     os.makedirs(os.path.dirname(COOKIES_PATH), exist_ok=True)
     with open(COOKIES_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return len(data)
+
 
 
 class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
@@ -241,8 +270,9 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                 return self.async_show_form(
                     step_id="cookie",
                     data_schema=_cookie_schema(username),
-                    errors=errors,
+                    errors=errors or {"base": "unknown"},
                 )
+
 
             if session_token:
                 return self.async_create_entry(
@@ -255,11 +285,12 @@ class ChargePointFlowHandler(ConfigFlow, domain=DOMAIN):
                 )
 
         # Premier affichage de l'étape cookies (ou ré-affichage avec erreurs)
-        return self.async_show_form(
-            step_id="cookie",
-            data_schema=_cookie_schema(username),
-            errors=errors,
-        )
+                return self.async_show_form(
+                    step_id="cookie",
+                    data_schema=_cookie_schema(username),
+                    errors=errors or {"base": "unknown"},
+                )
+
 
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
