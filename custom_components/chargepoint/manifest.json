@@ -1,7 +1,7 @@
 {
   "domain": "chargepoint",
   "name": "ChargePointTest",
-  "version": "0.1.3-local",
+  "version": "0.1.4-local",
   "documentation": "https://github.com/Frazou1/chargepoint-test",
   "issue_tracker": "https://github.com/Frazou1/chargepoint-test/issues",
   "integration_type": "hub",
