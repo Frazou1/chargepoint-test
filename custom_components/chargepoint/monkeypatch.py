@@ -79,6 +79,16 @@ def apply_scoped_patch():
 
     import python_chargepoint.client as cpc
 
+    # --- helpers internes (pas d'I/O) ---------------------------------------
+    def _get_cookie_value(name: str) -> str | None:
+        try:
+            for c in _scraper.cookies:
+                if c.name == name and c.value:
+                    return c.value
+        except Exception:
+            pass
+        return None
+
     # Sauvegarde du login original
     _orig_login = cpc.ChargePoint.login
 
@@ -93,8 +103,13 @@ def apply_scoped_patch():
         if _has_auth_cookies():
             _LOGGER.warning("ChargePoint: cookies présents → skip login().")
             try:
-                # Donner un token "JWT-like" pour satisfaire les validations de format
-                self.session_token = "eyJhbGciOiJIUzI1NiJ9.cookie.auth"
+                # Utiliser le JWT réel du cookie 'auth-session' (format correct)
+                jwt = _get_cookie_value("auth-session")
+                if jwt:
+                    self.session_token = jwt
+                else:
+                    # fallback ultra-minimal si jamais absent (devrait pas arriver)
+                    self.session_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjb29raWUtYXV0aCJ9.sig"
             except Exception:
                 pass
             return True
@@ -120,8 +135,7 @@ def apply_scoped_patch():
         def _patched_headers(self, *args, **kwargs):
             h = _orig(self, *args, **kwargs)
             try:
-                # h peut être dict ou list de tuples selon l'implémentation;
-                # on force un dict pour manipuler proprement.
+                # h peut être dict ou list de tuples selon l'implémentation
                 if isinstance(h, list):
                     h = dict(h)
                 if _has_auth_cookies():
@@ -134,6 +148,6 @@ def apply_scoped_patch():
         _patched_headers.__name__ = "_patched_headers"
         setattr(cpc.ChargePoint, method_name, _patched_headers)
 
-    # Essaye de patcher _headers (méthode la plus courante) puis fallback sur headers
+    # Essaye de patcher _headers puis fallback sur headers
     _wrap_headers_method("_headers")
     _wrap_headers_method("headers")
