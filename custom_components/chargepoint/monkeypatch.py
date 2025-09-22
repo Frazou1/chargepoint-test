@@ -1,183 +1,155 @@
-# custom_components/chargepoint/monkeypatch.py
 from __future__ import annotations
-import json
+
 import logging
-from typing import Iterable
-from requests.cookies import RequestsCookieJar
+from typing import Optional
 
 _LOGGER = logging.getLogger(__name__)
 
-COOKIES_PATH = "/config/chargepoint_cookies.json"
-_scraper = None  # construit une seule fois
+# Scraper global, construit une seule fois par instance HA
+_scraper = None  # type: ignore[assignment]
 
-# ---------- util cookies ----------
 
-def _parse_cookie_header(header: str) -> list[dict]:
-    items: list[dict] = []
-    for part in header.split(";"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        items.append({"name": name.strip(), "value": value.strip()})
-    return items
-
-def _to_cookiejar(raw: Iterable[dict] | str) -> RequestsCookieJar:
-    """Accepte une liste d'objets {name,value[,domain,path]} OU un header 'a=b; c=d'."""
-    if isinstance(raw, str):
-        data = _parse_cookie_header(raw)
-    else:
-        data = list(raw or [])
-    jar = RequestsCookieJar()
-    if not data:
-        return jar
-
-    # Domaines probables utilisés par ChargePoint
-    domains = [
-        ".chargepoint.com",
-        "chargepoint.com",
-        "www.chargepoint.com",
-        "account.chargepoint.com",
-        "ca.chargepoint.com",
-    ]
-    for item in data:
-        name = item.get("name")
-        value = item.get("value")
-        if not name or value is None:
-            continue
-        # si le JSON inclut domain/path on les respecte, sinon on duplique
-        dom = item.get("domain")
-        path = item.get("path", "/")
-        if dom:
-            jar.set(name, value, domain=dom, path=path)
-        else:
-            for d in domains:
-                jar.set(name, value, domain=d, path=path)
-    return jar
-
-def _read_cookie_file() -> RequestsCookieJar | None:
-    try:
-        with open(COOKIES_PATH, "r", encoding="utf-8") as f:
-            txt = f.read().strip()
-        if not txt:
-            return None
-        raw = json.loads(txt) if txt.startswith("[") else txt  # liste JSON OU header
-        return _to_cookiejar(raw)
-    except FileNotFoundError:
-        _LOGGER.debug("ChargePoint: fichier cookies introuvable: %s", COOKIES_PATH)
-        return None
-    except Exception as e:
-        _LOGGER.debug("ChargePoint: lecture cookies a échoué: %s", e)
-        return None
-
-# ---------- scraper / patch ----------
+# ---------- helpers: construction du scraper ----------
 
 def _build_scraper():
+    """
+    Construit un cloudscraper prêt pour des endpoints protégés par Cloudflare/DataDome.
+    Fait en executor par ensure_scraper() (pas d'I/O bloquante dans l'event loop).
+    """
     import cloudscraper
+
     s = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
-    # Headers réalistes
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/116 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-        "Origin": "https://ca.chargepoint.com",
-        "Referer": "https://ca.chargepoint.com/drivers/home",
-        "X-Requested-With": "XMLHttpRequest",
-    })
-    s.headers.pop("Authorization", None)
+
+    # En-têtes "browser-like"
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/116.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+            # Certains backends vérifient Origin/Referer pour les API privées
+            "Origin": "https://ca.chargepoint.com",
+            "Referer": "https://ca.chargepoint.com/dashboard",
+        }
+    )
     return s
 
+
 async def ensure_scraper(hass):
-    """Construit le scraper et (ré)injecte les cookies depuis /config/… dans l'executor."""
+    """
+    Construit le scraper dans un thread executor (safe pour HA).
+    À appeler au début (setup de l’intégration).
+    """
     global _scraper
     if _scraper is None:
         _LOGGER.warning("ChargePoint: création du scraper en executor…")
         _scraper = await hass.async_add_executor_job(_build_scraper)
 
-    def load_jar_sync():
-        return _read_cookie_file()
 
-    jar = await hass.async_add_executor_job(load_jar_sync)
-    if jar and len(jar) > 0:
-        before = len(_scraper.cookies)
-        _scraper.cookies.update(jar)
-        after = len(_scraper.cookies)
-        # pour debug : affiche quelques noms importants si présents
-        has_dd = any(c.name.lower() == "datadome" for c in _scraper.cookies)
-        has_auth = any(c.name.lower() in ("auth-session", "coulomb_sess") for c in _scraper.cookies)
-        _LOGGER.warning(
-            "ChargePoint: cookies chargés (%s→%s). datadome=%s auth-session/coulomb_sess=%s",
-            before, after, has_dd, has_auth
-        )
-    else:
-        _LOGGER.debug("ChargePoint: aucun cookie chargé depuis %s", COOKIES_PATH)
+# ---------- marquage "autorisé" d'une instance ChargePoint ----------
 
-def apply_scoped_patch():
+def _set_logged_flags(obj) -> None:
     """
-    Force la lib à utiliser notre session dès __init__ et
-    considère l'instance 'loggée' si des cookies sont présents
-    (contourne le décorateur check_login).
+    Certaines versions de python_chargepoint utilisent des flags différents.
+    On les force tous.
+    """
+    for attr in ("_logged_in", "logged_in", "_is_logged_in", "_authenticated"):
+        try:
+            setattr(obj, attr, True)
+        except Exception:
+            pass
+
+
+def mark_authorized(client, token: Optional[str]) -> None:
+    """
+    Injecte le scraper global dans le client, pousse Authorization si fourni,
+    et marque l'instance comme "loggée" pour contourner check_login().
     """
     global _scraper
     if _scraper is None:
         raise RuntimeError("ChargePoint: scraper non initialisé (ensure_scraper manquant)")
 
-    import python_chargepoint.client as cpc
+    # 1) Session HTTP
+    try:
+        client._session = _scraper  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
-    def _mark_logged_in(obj):
-        # Marque tous les drapeaux plausibles que la lib pourrait tester
+    # 2) Headers Authorization
+    try:
+        # nettoie un éventuel header existant
+        _scraper.headers.pop("Authorization", None)
+    except Exception:
+        pass
+
+    if token:
         try:
-            obj._session = _scraper
+            _scraper.headers["Authorization"] = f"Bearer {token}"
         except Exception:
             pass
-        # Ne PAS pousser d'Authorization par défaut quand on est en cookies-only
+        # certaines versions lisent encore `session_token`
         try:
-            obj._session.headers.pop("Authorization", None)
-        except Exception:
-            pass
-
-        # Drapeaux d'état (on met large pour couvrir plusieurs versions de lib)
-        for attr, val in [
-            ("_logged_in", True),
-            ("logged_in", True),
-            ("_is_logged_in", True),
-            ("_authenticated", True),
-        ]:
-            try:
-                setattr(obj, attr, val)
-            except Exception:
-                pass
-
-        # Ne pas forcer de token (certaines versions valident le format)
-        try:
-            if hasattr(obj, "session_token"):
-                obj.session_token = None
+            client.session_token = token  # type: ignore[attr-defined]
         except Exception:
             pass
 
-    # Patch __init__ pour injecter notre session et marquer loggé si cookies présents
-    _orig_init = cpc.ChargePoint.__init__
-    def _patched_init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
-        _mark_logged_in(self)
+    # 3) Flags login
+    _set_logged_flags(client)
 
-    # Patch login() : si cookies → skip login serveur & marquer loggé
-    _orig_login = cpc.ChargePoint.login
-    def _patched_login(self, username, password):
-        _mark_logged_in(self)
-        if _scraper and _scraper.cookies and len(_scraper.cookies) > 0:
-            _LOGGER.warning("ChargePoint: cookies présents → skip login().")
+
+# ---------- patchage "soft" de la lib pour éviter Must login ----------
+
+def apply_scoped_patch():
+    """
+    Patch minimal : on remplace ChargePoint.check_login par une version qui
+    s’assure que la session & les flags sont OK et NE JETTE PAS d’exception.
+    On ne touche ni requests.Session, ni le login() (pas besoin en token-only).
+    """
+    global _scraper
+    if _scraper is None:
+        raise RuntimeError("ChargePoint: scraper non initialisé (ensure_scraper manquant)")
+
+    import python_chargepoint.client as cpc  # type: ignore
+
+    # Sauvegarde du check_login original si besoin de debug
+    _orig_check_login = getattr(cpc.ChargePoint, "check_login", None)
+
+    def _patched_check_login(self, *args, **kwargs):
+        # S'assurer que l'instance a bien notre scraper
+        try:
+            if getattr(self, "_session", None) is None:
+                self._session = _scraper  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        # Si Authorization est présent ou session_token non vide → on considère "loggé"
+        try:
+            has_auth_header = "Authorization" in getattr(self, "_session", {}).headers  # type: ignore[union-attr]
+        except Exception:
+            has_auth_header = False
+
+        has_token = False
+        try:
+            tok = getattr(self, "session_token", None)
+            has_token = bool(tok)
+        except Exception:
+            pass
+
+        if has_auth_header or has_token:
+            _set_logged_flags(self)
             return True
-        return _orig_login(self, username, password)
 
-    # Appliquer une seule fois
-    if getattr(cpc.ChargePoint.__init__, "__name__", "") != "_patched_init":
-        cpc.ChargePoint.__init__ = _patched_init
-    if getattr(cpc.ChargePoint.login, "__name__", "") != "_patched_login":
-        cpc.ChargePoint.login = _patched_login
+        # Fallback: si l’intégration n’a pas encore injecté le token,
+        # on ne lève pas d’exception pour ne pas casser la config page.
+        _set_logged_flags(self)
+        return True
+
+    # Appliquer le patch une seule fois
+    if getattr(cpc.ChargePoint.check_login, "__name__", "") != "_patched_check_login":
+        cpc.ChargePoint.check_login = _patched_check_login  # type: ignore[assignment]
+        _LOGGER.debug("ChargePoint: check_login() patché (token-only).")
