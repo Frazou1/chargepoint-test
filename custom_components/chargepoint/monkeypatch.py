@@ -44,33 +44,78 @@ def _set_logged_flags(obj) -> None:
             pass
 
 
-def mark_authorized(client, token: Optional[str]) -> None:
-    global _scraper
-    if _scraper is None:
-        raise RuntimeError("ChargePoint: scraper non initialisé (ensure_scraper manquant)")
+def mark_authorized(client, token: str, region_hint: str | None = None) -> None:
+    """
+    Prépare la session HTTP pour le mode token-only :
+      - Authorization: Bearer <auth-session>
+      - Cookies auth-session + coulomb_sess (si dispos dans le token/cookies locaux)
+      - Origin/Referer en cohérence avec le sous-domaine (ex: ca.chargepoint.com)
+    """
+    import re
+    from urllib.parse import urlparse
 
-    # Session HTTP
+    s = getattr(client, "_session", None) or getattr(client, "session", None)
+    if s is None:
+        raise RuntimeError("ChargePoint: session HTTP introuvable sur le client")
+
+    # ---------- Détection région ----------
+    # Si tu as un cookie 'sub_domain=ca' on force le referer/origin vers ca.chargepoint.com
+    origin = "https://www.chargepoint.com"
+    referer = "https://www.chargepoint.com/"
     try:
-        client._session = _scraper  # type: ignore[attr-defined]
+        # si déjà chargés depuis /config/chargepoint_cookies.json
+        for c in s.cookies:
+            if c.name == "sub_domain" and c.value.lower() == "ca":
+                origin = "https://ca.chargepoint.com"
+                referer = "https://ca.chargepoint.com/"
+                break
+    except Exception:
+        pass
+    if region_hint and region_hint.lower() in ("ca", "canada"):
+        origin = "https://ca.chargepoint.com"
+        referer = "https://ca.chargepoint.com/"
+
+    # ---------- Header d’autorisation ----------
+    bearer = token.strip()
+    # Beaucoup de gens collent directement la valeur du cookie auth-session : c’est OK.
+    # S’ils collent "Bearer <jwt>", on nettoie pour ne garder que le JWT.
+    if bearer.lower().startswith("bearer "):
+        bearer = bearer[7:].strip()
+
+    s.headers.update({
+        "Authorization": f"Bearer {bearer}",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": origin,
+        "Referer": referer,
+        # UA/Accept-Lang déjà posés à la création du scraper
+        "X-Requested-With": "XMLHttpRequest",
+    })
+
+    # ---------- Cookies ----------
+    # 1) auth-session = <JWT> (obligatoire côté web)
+    try:
+        s.cookies.set("auth-session", bearer, domain=".chargepoint.com", path="/")
     except Exception:
         pass
 
-    # Header Authorization
+    # 2) coulomb_sess si on a déjà un jar (chargé depuis cookies.json)
+    #    (pas obligatoire partout, mais améliore l’acceptation côté API web)
+    has_coulomb = any(c.name == "coulomb_sess" for c in s.cookies)
+    # Rien à faire si déjà présent. Si tu veux forcer manuellement :
+    # s.cookies.set("coulomb_sess", "<valeur>", domain=".chargepoint.com", path="/")
+
+    # ---------- Indicateurs internes du client ----------
+    # Certains points de la lib vérifient ces flags/attributs.
     try:
-        _scraper.headers.pop("Authorization", None)
+        client._logged_in = True
     except Exception:
         pass
-    if token:
-        try:
-            _scraper.headers["Authorization"] = f"Bearer {token}"
-        except Exception:
-            pass
-        try:
-            client.session_token = token  # type: ignore[attr-defined]
-        except Exception:
-            pass
+    # Session token non utilisé en token-only, mais on met une valeur neutre
+    try:
+        client.session_token = bearer
+    except Exception:
+        pass
 
-    _set_logged_flags(client)
 
 
 # ---------- patch "token-only" (sans check_login) ----------
