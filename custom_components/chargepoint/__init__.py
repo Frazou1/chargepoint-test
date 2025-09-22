@@ -3,6 +3,7 @@ Custom integration to integrate ChargePoint with Home Assistant (token-only).
 """
 
 from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from datetime import timedelta
@@ -60,7 +61,7 @@ async def async_setup(hass: HomeAssistant, entry: ConfigEntry):
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Setup with bearer token only (no username/password)."""
+    """Setup with bearer token only."""
     await monkeypatch.ensure_scraper(hass)
     monkeypatch.apply_scoped_patch()
 
@@ -75,9 +76,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         raise ConfigEntryAuthFailed("empty_token")
 
     try:
-        # IMPORTANT : ne PAS passer le token au constructeur (sinon validation de format)
-        client: ChargePoint = await hass.async_add_executor_job(ChargePoint, "", "")
-        # Injecter le token/cookies/headers + marquer l'instance comme autorisée
+        # Signatures récentes: ChargePoint(username, password, session_token)
+        client: ChargePoint = await hass.async_add_executor_job(
+            ChargePoint, "", "", token
+        )
+        # Injecter le header Authorization + marquer comme "auth"
         monkeypatch.mark_authorized(client, token)
 
     except ChargePointBaseException as exc:
@@ -90,7 +93,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     hass.data.setdefault(DOMAIN, {})
 
     async def async_update_data(is_retry: bool = False):
-        """Fetch data from ChargePoint API (token-only, sans relogin)."""
+        """Fetch data from ChargePoint API (no relogin; token-only)."""
         data = {
             ACCT_INFO: None,
             ACCT_CRG_STATUS: None,
@@ -114,31 +117,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 )
                 data[ACCT_SESSION] = crg_session
 
-            home_chargers: list = await hass.async_add_executor_job(
-                client.get_home_chargers
-            )
-            for charger in home_chargers:
-                hcrg_status: HomeChargerStatus = await hass.async_add_executor_job(
-                    client.get_home_charger_status, charger
+            # --- Home chargers (robuste aux réponses partielles) ---
+            try:
+                home_chargers: list = await hass.async_add_executor_job(
+                    client.get_home_chargers
                 )
-                hcrg_tech_info: HomeChargerTechnicalInfo = (
-                    await hass.async_add_executor_job(
-                        client.get_home_charger_technical_info, charger
+            except Exception as e:
+                _LOGGER.warning(
+                    "get_home_chargers a échoué (%s) → on continue sans bornes",
+                    e,
+                )
+                home_chargers = []
+
+            for charger in home_chargers or []:
+                try:
+                    hcrg_status: HomeChargerStatus = await hass.async_add_executor_job(
+                        client.get_home_charger_status, charger
                     )
-                )
-                data[ACCT_HOME_CRGS][charger] = (hcrg_status, hcrg_tech_info)
+                    hcrg_tech_info: HomeChargerTechnicalInfo = (
+                        await hass.async_add_executor_job(
+                            client.get_home_charger_technical_info, charger
+                        )
+                    )
+                    data[ACCT_HOME_CRGS][charger] = (hcrg_status, hcrg_tech_info)
+                except Exception as e:
+                    _LOGGER.warning(
+                        "Impossible de récupérer les infos de la borne %s (%s)",
+                        charger,
+                        e,
+                    )
 
             return data
 
         except ChargePointInvalidSession as exc:
-            # Token invalide/expiré : on ré-injecte une fois puis on remonte en reauth si échec
-            _LOGGER.warning("ChargePoint: invalid/expired token, re-inject and retry…")
-            try:
-                monkeypatch.mark_authorized(client, token)
-                if not is_retry:
-                    return await async_update_data(is_retry=True)
-            except Exception:
-                pass
+            # Pas de relogin en token-only : on remonte une réauth
+            _LOGGER.error("Invalid/expired token for ChargePoint")
             raise ConfigEntryAuthFailed("invalid_token") from exc
 
         except ChargePointCommunicationException as err:
