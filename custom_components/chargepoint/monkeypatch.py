@@ -121,7 +121,8 @@ async def ensure_scraper(hass):
 def apply_scoped_patch():
     """
     Force la lib à utiliser notre session dès __init__ et
-    skip login() si des cookies sont présents.
+    considère l'instance 'loggée' si des cookies sont présents
+    (contourne le décorateur check_login).
     """
     global _scraper
     if _scraper is None:
@@ -129,28 +130,53 @@ def apply_scoped_patch():
 
     import python_chargepoint.client as cpc
 
-    _orig_init = cpc.ChargePoint.__init__
-    def _patched_init(self, *args, **kwargs):
-        _orig_init(self, *args, **kwargs)
+    def _mark_logged_in(obj):
+        # Marque tous les drapeaux plausibles que la lib pourrait tester
         try:
-            self._session = _scraper
-            self._session.headers.pop("Authorization", None)
+            obj._session = _scraper
+        except Exception:
+            pass
+        # Ne PAS pousser d'Authorization par défaut quand on est en cookies-only
+        try:
+            obj._session.headers.pop("Authorization", None)
         except Exception:
             pass
 
-    _orig_login = cpc.ChargePoint.login
-    def _patched_login(self, username, password):
+        # Drapeaux d'état (on met large pour couvrir plusieurs versions de lib)
+        for attr, val in [
+            ("_logged_in", True),
+            ("logged_in", True),
+            ("_is_logged_in", True),
+            ("_authenticated", True),
+        ]:
+            try:
+                setattr(obj, attr, val)
+            except Exception:
+                pass
+
+        # Ne pas forcer de token (certaines versions valident le format)
         try:
-            self._session = _scraper
-            self._session.headers.pop("Authorization", None)
+            if hasattr(obj, "session_token"):
+                obj.session_token = None
         except Exception:
             pass
-        # Si on a des cookies, on évite l'endpoint de login (DataDome)
+
+    # Patch __init__ pour injecter notre session et marquer loggé si cookies présents
+    _orig_init = cpc.ChargePoint.__init__
+    def _patched_init(self, *args, **kwargs):
+        _orig_init(self, *args, **kwargs)
+        _mark_logged_in(self)
+
+    # Patch login() : si cookies → skip login serveur & marquer loggé
+    _orig_login = cpc.ChargePoint.login
+    def _patched_login(self, username, password):
+        _mark_logged_in(self)
         if _scraper and _scraper.cookies and len(_scraper.cookies) > 0:
             _LOGGER.warning("ChargePoint: cookies présents → skip login().")
             return True
         return _orig_login(self, username, password)
 
+    # Appliquer une seule fois
     if getattr(cpc.ChargePoint.__init__, "__name__", "") != "_patched_init":
         cpc.ChargePoint.__init__ = _patched_init
     if getattr(cpc.ChargePoint.login, "__name__", "") != "_patched_login":
